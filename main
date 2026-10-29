@@ -1,0 +1,400 @@
+
+"""CoppeliaSim Quadcopter mapping — clean Cartesian voxel viewer.
+
+Keeps the existing FlightMission Lua, Quadcopter controller and scanner.
+Matplotlib shows measured surface voxel cubes with numeric X/Y/Z axes.
+No Open3D, RANSAC, fake height columns or inferred object boxes.
+
+Run:     python main.py
+Replay:  python main.py --view results/mapping_data.npz
+Export:  python main.py --view results/mapping_data.npz --headless
+"""
+
+import argparse
+import time
+from pathlib import Path
+
+import numpy as np
+
+DRONE = '/Quadcopter'
+SCANNER = '/Quadcopter/fast3DLaserScanner'
+OUTPUT = Path(__file__).resolve().parent / 'results'
+MAX_SIM_SECONDS = 165.0
+MAX_WALL_SECONDS = 300.0
+MIN_DISTANCE = 0.25
+MAX_DISTANCE = 8.0
+
+
+def matrix4(values):
+    """CoppeliaSim row-major 3x4 matrix -> 4x4 homogeneous matrix."""
+    data = np.asarray(values, dtype=float)
+    if data.size != 12:
+        raise ValueError(f'Expected 12 transformation values, got {data.size}')
+    result = np.eye(4)
+    result[:3, :] = data.reshape(3, 4)
+    return result
+
+
+def read_sensor(sim, handle):
+    """Read the same vision parameters as the original working script."""
+    info = {
+        'handle': handle,
+        'width': sim.getObjectInt32Param(handle, sim.visionintparam_resolution_x),
+        'height': sim.getObjectInt32Param(handle, sim.visionintparam_resolution_y),
+        'angle': sim.getObjectFloatParam(handle, sim.visionfloatparam_perspective_angle),
+        'near': sim.getObjectFloatParam(handle, sim.visionfloatparam_near_clipping),
+        'far': sim.getObjectFloatParam(handle, sim.visionfloatparam_far_clipping),
+        'perspective': sim.getObjectInt32Param(handle, sim.visionintparam_perspective_operation),
+    }
+    missing = [k for k, v in info.items() if v is None]
+    if missing:
+        raise RuntimeError(f'Unavailable vision sensor parameters: {missing}')
+    if not info['perspective']:
+        raise RuntimeError('Only perspective vision sensors are supported')
+    print(f"Vision sensor {handle}: {info['width']}x{info['height']}, far={info['far']:.2f} m")
+    return info
+
+
+def depth_points(buffer, resolution, info, stride):
+    """Metric depth buffer -> sensor-frame XYZ, matching the working version."""
+    width, height = map(int, resolution)
+    if isinstance(buffer, (bytes, bytearray, memoryview)):
+        raw = np.frombuffer(buffer, dtype=np.float32)
+    else:
+        raw = np.asarray(buffer, dtype=np.float32).ravel()
+    if raw.size != width * height:
+        raise ValueError(f'Depth size mismatch: {raw.size} != {width*height}')
+    depth = raw.reshape(height, width)
+    u = np.arange(0, width, stride)
+    v = np.arange(0, height, stride)
+    U, V = np.meshgrid(u, v)
+    D = depth[np.ix_(v, u)]
+    valid = (np.isfinite(D)
+             & (D > max(info['near'] + 0.015, MIN_DISTANCE))
+             & (D < min(info['far'] - 0.02, MAX_DISTANCE)))
+    if not valid.any():
+        return np.empty((0, 3))
+    aspect = width / height
+    if aspect >= 1:
+        fx = np.tan(info['angle'] / 2)
+        fy = fx / aspect
+    else:
+        fy = np.tan(info['angle'] / 2)
+        fx = fy * aspect
+    d = D[valid].astype(float)
+    x = d * fx * (1 - 2 * U[valid] / max(width - 1, 1))
+    y = d * fy * (2 * V[valid] / max(height - 1, 1) - 1)
+    return np.column_stack((x, y, d))
+
+
+def voxel_keys(points, size):
+    """Unique world-aligned occupied cells. No artificial filling."""
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    points = points[np.isfinite(points).all(axis=1)]
+    if not len(points):
+        return np.empty((0, 3), dtype=np.int64)
+    return np.unique(np.floor(points / size).astype(np.int64), axis=0)
+
+
+def visible_quads(keys, size):
+    """Faces of observed voxel cells, omitting shared internal faces."""
+    occupied = set(map(tuple, keys))
+    corners = np.array([
+        (0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
+        (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)
+    ], dtype=float)
+    sides = [
+        ((0, 0, -1), (0, 3, 2, 1)), ((0, 0, 1), (4, 5, 6, 7)),
+        ((0, -1, 0), (0, 1, 5, 4)), ((0, 1, 0), (3, 7, 6, 2)),
+        ((-1, 0, 0), (0, 4, 7, 3)), ((1, 0, 0), (1, 2, 6, 5)),
+    ]
+    quads, heights = [], []
+    for key in keys:
+        vertices = (corners + key) * size
+        for offset, face in sides:
+            if tuple(key + offset) not in occupied:
+                quads.append(vertices[list(face)])
+                heights.append((key[2] + .5) * size)
+    return np.asarray(quads, dtype=np.float32).reshape(-1, 4, 3), np.asarray(heights)
+
+
+def save_ply(filename, points, rgb):
+    """ASCII colored point-cloud PLY (full resolution of measured data)."""
+    with filename.open('w', encoding='ascii') as file:
+        file.write('ply\nformat ascii 1.0\n')
+        file.write(f'element vertex {len(points)}\n')
+        file.write('property float x\nproperty float y\nproperty float z\n')
+        file.write('property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n')
+        for p, color in zip(points, rgb):
+            file.write(f'{p[0]:.5f} {p[1]:.5f} {p[2]:.5f} '
+                       f'{color[0]} {color[1]} {color[2]}\n')
+
+
+def save_quads_ply(filename, quads, rgb):
+    """PLY geometry for the display cubes (may use coarser display cells)."""
+    with filename.open('w', encoding='ascii') as file:
+        count = len(quads)
+        file.write('ply\nformat ascii 1.0\n')
+        file.write(f'element vertex {count * 4}\n')
+        file.write('property float x\nproperty float y\nproperty float z\n')
+        file.write('property uchar red\nproperty uchar green\nproperty uchar blue\n')
+        file.write(f'element face {count * 2}\n')
+        file.write('property list uchar int vertex_indices\nend_header\n')
+        for face, color in zip(quads, rgb):
+            for p in face:
+                file.write(f'{p[0]:.5f} {p[1]:.5f} {p[2]:.5f} '
+                           f'{color[0]} {color[1]} {color[2]}\n')
+        for k in range(count):
+            i = 4 * k
+            file.write(f'3 {i} {i+1} {i+2}\n3 {i} {i+2} {i+3}\n')
+
+
+def plot_cartesian(points, path, voxel_size, mode, display_limit, out, headless):
+    """Original-style Cartesian axes + main(2)-style colored voxel faces."""
+    import matplotlib.pyplot as plt
+    from matplotlib import colors, cm, ticker
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    path = np.asarray(path, dtype=float).reshape(-1, 4)
+    all_keys = voxel_keys(points, voxel_size)
+    centers = (all_keys + .5) * voxel_size
+    zlo, zhi = float(points[:, 2].min()), float(points[:, 2].max())
+    norm = colors.Normalize(zlo, zhi if zhi > zlo else zlo + 0.001)
+    cmap = plt.get_cmap('turbo')
+
+    fig = plt.figure(figsize=(12, 9), facecolor='white')
+    ax = fig.add_subplot(111, projection='3d')
+
+    if mode == 'cubes':
+        # Coarsen only the DISPLAY mesh when extremely dense.
+        display_size, show_keys = voxel_size, all_keys
+        for _ in range(25):
+            if len(show_keys) <= display_limit:
+                break
+            display_size *= 1.25
+            show_keys = voxel_keys(points, display_size)
+        if len(show_keys) > display_limit:
+            # Retain the shape without exceeding an expensive GUI render.
+            show_keys = show_keys[::int(np.ceil(len(show_keys) / display_limit))]
+        quads, face_z = visible_quads(show_keys, display_size)
+        face_colors = cmap(norm(face_z))
+        mesh = Poly3DCollection(quads, facecolors=face_colors, linewidths=0,
+                                edgecolors='none', zsort='average')
+        ax.add_collection3d(mesh)
+        rgb = np.rint(face_colors[:, :3] * 255).astype(np.uint8)
+        save_quads_ply(out / '04_display_voxel_cubes.ply', quads, rgb)
+        print(f'3D display: {len(show_keys):,} cubes at {display_size:.3f} m; '
+              f'{len(all_keys):,} measured {voxel_size:.3f} m cells preserved in CSV/PLY')
+    else:
+        sample = centers[::max(1, int(np.ceil(len(centers) / 80000)))]
+        ax.scatter(*sample.T, c=sample[:, 2], cmap=cmap, norm=norm,
+                   s=2, depthshade=False, rasterized=True)
+
+    if len(path):
+        ax.plot(path[:, 1], path[:, 2], path[:, 3],
+                color='blue', lw=1.7, label='Drone trajectory')
+        ax.legend(loc='upper right')
+
+    # Real Cartesian numeric axes: labels show WORLD X, Y and Z in meters.
+    combined = np.vstack((points, path[:, 1:4])) if len(path) else points
+    low, high = combined.min(axis=0), combined.max(axis=0)
+    extent = np.maximum(high - low, 0.2)
+    padding = np.maximum(extent * 0.06, voxel_size)
+    ax.set_xlim(low[0] - padding[0], high[0] + padding[0])
+    ax.set_ylim(low[1] - padding[1], high[1] + padding[1])
+    ax.set_zlim(min(0.0, low[2] - padding[2]), high[2] + padding[2])
+    ax.set_box_aspect(np.maximum(extent, 0.3))
+    ax.set_xlabel('X (m)', labelpad=10)
+    ax.set_ylabel('Y (m)', labelpad=10)
+    ax.set_zlabel('Z / height (m)', labelpad=10)
+    ax.zaxis.set_major_locator(ticker.MaxNLocator(nbins=7))
+    ax.zaxis.set_major_formatter(ticker.FormatStrFormatter('%.2f'))
+    ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=7))
+    ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=7))
+    ax.grid(True, alpha=.35)
+    ax.view_init(elev=27, azim=-60)
+    ax.set_title('Drone 3D voxel mapping | Cartesian coordinates (m)', pad=16)
+    bar = fig.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax,
+                       shrink=.63, pad=.10, fraction=.04)
+    bar.set_label('Measured world Z (m)')
+    fig.text(.03, .02, f'Measured surface voxels: {len(all_keys):,} | '
+             f'cell: {voxel_size:.3f} m | Z: {zlo:.2f} to {zhi:.2f} m', fontsize=10)
+    fig.savefig(out / '03_voxel_cartesian_3d.png', dpi=170, bbox_inches='tight')
+    if not headless:
+        print('Mouse: drag to rotate; scroll to zoom. Numeric height is on the Z axis.')
+        plt.show(block=True)
+    plt.close(fig)
+    return centers, zlo, zhi
+
+
+def export_results(points, trajectory, args):
+    """Keep old outputs; add the new Cartesian 3D image and voxel mesh."""
+    import matplotlib.pyplot as plt
+
+    OUTPUT.mkdir(exist_ok=True, parents=True)
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    points = points[np.isfinite(points).all(axis=1)]
+    path = np.asarray(trajectory, dtype=float).reshape(-1, 4)
+    np.savez_compressed(OUTPUT / 'mapping_data.npz', points_world=points, trajectory=path)
+    np.savetxt(OUTPUT / 'drone_trajectory.csv', path, delimiter=',',
+               header='simulation_time,x,y,z', comments='')
+    if not len(points):
+        print('No 3D points collected; trajectory was saved.')
+        return
+
+    keys = voxel_keys(points, args.voxel_size)
+    centers = (keys + .5) * args.voxel_size
+    plt_cmap = plt.get_cmap('turbo')
+    lo, hi = points[:, 2].min(), points[:, 2].max()
+    denom = max(hi - lo, .001)
+    rgb = np.rint(255 * plt_cmap(np.clip((centers[:, 2] - lo) / denom, 0, 1))[:, :3]).astype(np.uint8)
+    save_ply(OUTPUT / 'raw_scan.ply', points,
+             np.tile(np.array([220, 40, 40], dtype=np.uint8), (len(points), 1)))
+    save_ply(OUTPUT / 'voxel_height_coloured.ply', centers, rgb)
+    np.savetxt(OUTPUT / 'voxel_xyz.csv', centers, delimiter=',',
+               header='x,y,z', comments='')
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    sample = points[::max(1, len(points) // 80000)]
+    ax.scatter(sample[:, 0], sample[:, 1], color='red', s=.6, alpha=.6)
+    if len(path):
+        ax.plot(path[:, 1], path[:, 2], color='blue', lw=1.8)
+    ax.set(xlabel='X (m)', ylabel='Y (m)', title='2D map and drone trajectory')
+    ax.set_aspect('equal', adjustable='box')
+    ax.grid(True)
+    fig.savefig(OUTPUT / '01_mapping_2d.png', dpi=170, bbox_inches='tight')
+    plt.close(fig)
+
+    # Cartesian plot is deliberately the ONLY post-flight 3D viewer.
+    plot_cartesian(points, path, args.voxel_size, args.mode,
+                   args.display_limit, OUTPUT, args.headless)
+    print('Saved to:', OUTPUT)
+    for name in ('01_mapping_2d.png', '03_voxel_cartesian_3d.png',
+                 'voxel_xyz.csv', 'raw_scan.ply', 'voxel_height_coloured.ply',
+                 'mapping_data.npz', 'drone_trajectory.csv'):
+        print(' ', name)
+
+
+def collect_flight(args):
+    """Original FlightMission + ZMQ stepping, no flight controller changes."""
+    from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+    sim = RemoteAPIClient().require('sim')
+    print('ZMQ connection established.')
+    if sim.getSimulationState() != sim.simulation_stopped:
+        raise RuntimeError('Stop the CoppeliaSim simulation before starting Python')
+    drone = sim.getObject(DRONE)
+    scanner = sim.getObject(SCANNER)
+    mission = sim.getObject('/FlightMission', {'noError': True})
+    if mission is None or mission < 0:
+        raise RuntimeError('Missing /FlightMission dummy + original Lua mission script')
+    handles = sim.getObjectsInTree(scanner, sim.sceneobject_visionsensor, 1)
+    if not handles:
+        raise RuntimeError('No vision sensor found under fast3DLaserScanner')
+    sensors = []
+    for h in handles:
+        try:
+            sensors.append(read_sensor(sim, h))
+        except Exception as exc:
+            print(f'Skipping sensor {h}: {exc}')
+    if not sensors:
+        raise RuntimeError('No usable depth sensors')
+
+    batches, path = [], []
+    next_scan = 0.0
+    next_report = 0.0
+    started = False
+    wall_start = time.monotonic()
+    try:
+        sim.setStepping(True)
+        sim.startSimulation()
+        started = True
+        t0 = sim.getSimulationTime()
+        print('FlightMission Lua will fly the drone; Python only scans.')
+        while True:
+            sim.step()
+            elapsed = sim.getSimulationTime() - t0
+            if sim.getSimulationState() == sim.simulation_stopped:
+                print('Simulation stopped externally')
+                break
+            pos = sim.getObjectPosition(drone, sim.handle_world)
+            path.append([sim.getSimulationTime(), *pos])
+            if elapsed >= next_scan:
+                next_scan = elapsed + args.acquire_every
+                T_world_body = matrix4(sim.getObjectMatrix(drone, sim.handle_world))
+                count = 0
+                for info in sensors:
+                    try:
+                        raw, resolution = sim.getVisionSensorDepth(info['handle'], 1)
+                        local = depth_points(raw, resolution, info, args.pixel_stride)
+                        if not len(local):
+                            continue
+                        T_body_sensor = matrix4(sim.getObjectMatrix(info['handle'], drone))
+                        body = local @ T_body_sensor[:3, :3].T + T_body_sensor[:3, 3]
+                        world = body @ T_world_body[:3, :3].T + T_world_body[:3, 3]
+                        batches.append(world.astype(np.float32))
+                        count += len(world)
+                    except Exception as exc:
+                        print(f'Vision sensor {info["handle"]}: {exc}')
+                if elapsed >= next_report:
+                    next_report = elapsed + 5.0
+                    print(f't={elapsed:.1f}s | scan points={count} | drone XYZ={np.round(pos, 2)}')
+            try:
+                done = sim.getIntProperty(sim.handle_scene,
+                                          'signal.droneMappingDone', {'noError': True})
+            except Exception:
+                done = None
+            if done == 1:
+                print('FlightMission finished')
+                break
+            if elapsed >= MAX_SIM_SECONDS or time.monotonic() - wall_start >= MAX_WALL_SECONDS:
+                print('Flight limit reached; saving available data')
+                break
+    except KeyboardInterrupt:
+        print('Interrupted: saving available scans')
+    finally:
+        if started:
+            try:
+                sim.stopSimulation()
+            except Exception as exc:
+                print('Could not stop simulation:', exc)
+        points = np.vstack(batches) if batches else np.empty((0, 3), dtype=np.float32)
+        trajectory = np.asarray(path, dtype=float).reshape(-1, 4)
+        # Persist the raw scan BEFORE graphics so it survives plotting errors.
+        OUTPUT.mkdir(exist_ok=True, parents=True)
+        np.savez_compressed(OUTPUT / 'mapping_data.npz',
+                            points_world=points, trajectory=trajectory)
+    return points, trajectory
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--view', type=Path,
+                        help='Replay an existing mapping_data.npz, without CoppeliaSim')
+    parser.add_argument('--headless', action='store_true', help='Export only; no GUI')
+    parser.add_argument('--mode', choices=('cubes', 'points'), default='cubes',
+                        help='Voxel surfaces (default) or measured voxel centers')
+    parser.add_argument('--voxel-size', type=float, default=.04)
+    parser.add_argument('--display-limit', type=int, default=4500,
+                        help='Maximum displayed solid voxel cells; does not limit exports')
+    parser.add_argument('--pixel-stride', type=int, default=2)
+    parser.add_argument('--acquire-every', type=float, default=.20)
+    args = parser.parse_args()
+    if (not np.isfinite(args.voxel_size) or args.voxel_size <= 0
+            or args.display_limit < 100 or args.pixel_stride < 1
+            or not np.isfinite(args.acquire_every) or args.acquire_every <= 0):
+        parser.error('Check positive voxel size, display limit, stride, scan interval')
+    if args.headless:
+        import matplotlib
+        matplotlib.use('Agg')
+    if args.view:
+        with np.load(args.view, allow_pickle=False) as data:
+            points = data['points_world']
+            path = data['trajectory']
+    else:
+        points, path = collect_flight(args)
+    export_results(points, path, args)
+
+
+if __name__ == '__main__':
+    main()
