@@ -18,3 +18,5 @@ Floor / ExternalWall
 Permukaan lantai dan pembatas arena pemetaan.
 Cuboid[0]–[2]
 Tiga penghalang berbentuk kotak sebagai target pemindaian.
+
+https://youtu.be/f4QFwwTqsTs
